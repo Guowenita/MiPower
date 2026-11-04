@@ -1,0 +1,23 @@
+# 编译中间产物
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.tlog
+*.idb
+/build/
+/vc140.pdb
+
+# 真实凭据与本机配置 —— 绝不提交
+*.token
+!*.token.example
+**/config.ini
+!**/config.example.ini
+*.token.bak
+
+# 日志与临时文件
+*.log
+*.tmp
+*.bak
+_*.txt

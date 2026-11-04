@@ -1,0 +1,795 @@
+# MiPower Plugin — 全新独立插件设计方案
+
+> 目标：重新设计一套更简洁、更稳定的 TrafficMonitor 插件，用于实时采集并展示米家插座功耗。
+> 参考实现：`cxhuyo/MijiaPluginForTM`（本文档中标注为「原插件」）。
+> 目标设备：酷控 WiFi 插座 `sixwgh.plug.v8icwf` @ `192.168.1.10`，DID `1234567890`。
+
+---
+
+## 0. 为什么要重做而不是改原插件
+
+对原插件做了完整的静态分析 + 动态验证，结论如下。
+
+### 0.1 原插件的硬编码缺陷（本次实测确认）
+
+原插件 `MiioDevice.cpp::GetPower()`：
+
+```cpp
+// get_properties: siid=11, piid=2 (功率)
+std::string params = "[{\"did\":\"prop\",\"siid\":11,\"piid\":2}]";
+```
+
+这一行硬编码同时绑死了三件事：
+
+| 绑定项 | 问题 | 本机实测 |
+|---|---|---|
+| `siid=11` | `siid=11` 属于 `cuco.plug.v3` 规格 | 本机 `sixwgh.plug.v8icwf` 返回 **code -4003（属性不支持）** |
+| `piid=2` | 功率语义随型号漂移 | 本机功率在 **siid=4, piid=2**（power-consumption 服务） |
+| `did="prop"` | 占位符非真实 did | 本机实测 did 填任意值均返回 code 0，**设备只认 siid/piid** |
+
+而插件的解析逻辑（`result.find("\"value\":")` + `std::stod`）**不校验 `code` 字段**，
+所以 -4003 的错误响应会被解析成"读取成功"，最终表现就是**显示 0W 或连接失败**。
+
+### 0.2 逆向修改的成本评估
+
+我们实际做过一次二进制补丁（等长替换 `"prop"`→`"props"`、`11`→`4`），成本拆解：
+
+| 环节 | 实际耗时 | 说明 |
+|---|---|---|
+| 定位请求模板 | ~30 min | `strings` 扫 `[{...}]` 模式即可命中 |
+| 确认字段语义 | ~20 min | 需外部查 MIoT spec + 实测枚举 siid/piid |
+| 等长替换可行性 | ~15 min | 长度不等时会挤占后续字符串，必须凑等长 |
+| **验证补丁有效** | **~2 h** | **真正的瓶颈**：无法抓包（pktmon 需管理员、无 tshark），只能反复黑盒试 |
+| 确认加密正确性 | ~1 h | 需逆向 `MiioDevice.cpp` 逐字节核对 AES/IV/checksum |
+
+**结论：补丁本身的改造成本很低（分钟级），但「验证成本」极高（小时级）**，
+因为插件的所有网络 API 名称（`sendto`/`recvfrom`/`WSAStartup`）与 ini 键名都被作者混淆加密，
+无法通过静态分析直接定位发送逻辑，只能黑盒试探。
+
+### 0.3 更根本的问题
+
+即使补丁成功，这种改造仍有三个结构性缺陷无法通过补丁解决：
+
+1. **属性映射写死** —— 换一台型号不同的插座就再次失效，本质是「一次性修复」
+2. **单属性单请求** —— 每次只取功率一个属性，电压/电流/电量全部拿不到
+3. **无错误码处理** —— `-4003`/`-4001` 等错误码被当成功解析，故障静默
+
+**所以从零重做是对的**：不是「改起来麻烦」，而是「改完仍不通用」。
+
+---
+
+## 1. 整体架构与模块划分
+
+### 1.1 分层结构
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Layer 3  UI 层（TrafficMonitor 宿主集成）                     │
+│  ┌──────────────┬──────────────┬───────────────┐            │
+│  │ PowerItem    │ OptionsDlg   │ ToolTip/Stats │            │
+│  │ 任务栏显示    │ 设置对话框    │ 悬停统计      │            │
+│  └──────────────┴──────────────┴───────────────┘            │
+├──────────────────────────────────────────────────────────────┤
+│  Layer 2  服务层                                             │
+│  ┌────────────────┐  ┌────────────────┐  ┌───────────────┐  │
+│  │ DeviceRegistry │  │ PowerAggregator│  │ HistoryStore  │  │
+│  │ 多设备注册/路由 │  │ 采样聚合/统计   │  │ 持久化(环形)  │  │
+│  └────────────────┘  └────────────────┘  └───────────────┘  │
+├──────────────────────────────────────────────────────────────┤
+│  Layer 1  协议层                                             │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────┐    │
+│  │ MiioClient   │  │ MiotSpec     │  │ TokenProvider  │    │
+│  │ 协议编解码    │  │ 型号规格缓存  │  │ 多来源 token   │    │
+│  └──────────────┘  └──────────────┘  └────────────────┘    │
+├──────────────────────────────────────────────────────────────┤
+│  Layer 0  基础设施                                            │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────┐    │
+│  │ Crypto(MD5/  │  │ Scheduler    │  │ Logger/Diagnostics│  │
+│  │ AES-128-CBC) │  │ 定时/退避     │  │ 结构化日志      │  │
+│  └──────────────┘  └──────────────┘  └────────────────┘    │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 模块职责
+
+| 模块 | 职责 | 关键点 |
+|---|---|---|
+| **`MiioClient`** | miIO 协议编解码：握手、封包、AES-128-CBC、MD5、收发 | 纯协议层，**不含任何业务语义**，不知道"功率"是什么 |
+| **`MiotSpec`** | 型号 → 属性映射表；启动时探测 siid/piid 并缓存 | **解决硬编码问题的核心** |
+| **`TokenProvider`** | 多来源获取 token（ini / 本地文件 / 手机提取 / 云端） | 与采集完全解耦 |
+| **`DeviceRegistry`** | 管理 N 个设备实例，路由查询、健康状态 | 支持多插座 |
+| **`PowerAggregator`** | 采样入库、聚合、统计（min/max/avg/积分） | 时间对齐、缺口标记 |
+| **`HistoryStore`** | 内存环形缓冲 + 磁盘持久化（分钟级聚合） | 崩溃可恢复 |
+| **`Crypto`** | MD5 + AES-128-CBC（PKCS7） | 用 Windows CNG 替代自研，或用已验证实现 |
+| **`Scheduler`** | 定时采样 + 指数退避重连 | 长稳运行的关键 |
+| **`Logger`** | 结构化日志 + 环形日志缓冲 | 故障可诊断 |
+
+### 1.3 token 抓取与功耗采集的衔接
+
+**核心设计原则：token 抓取是「离线预处理」，功耗采集是「在线常态」，两者通过一个纯数据契约衔接。**
+
+```
+┌─────────────┐         ① 导出 token          ┌──────────────────┐
+│ TokenProvider│ ───────────────────────────►  │  token 文件       │
+│ (独立工具)   │   手机MMKV / 云端 / 手工粘贴    │  (纯文本, 32hex)  │
+└─────────────┘                               └────────┬─────────┘
+                                                         │ ② 只读加载
+                                                         ▼
+┌─────────────┐   ③ 采集     ┌─────────────┐        ┌──────────────┐
+│ MiioClient  │ ◄──────────► │  设备 54321  │        │ ConfigStore  │
+│ (MiOT 协议) │              └─────────────┘        │ (IP+token)   │
+└─────────────┘                                       └──────────────┘
+```
+
+**衔接契约（三条硬约束）：**
+
+1. **单向数据流**：token 只从 Provider 流向 Client，Client **永不**回写 token 文件
+2. **格式单一**：token 文件就是一行 32 位 hex，无 JSON、无 BOM、无编码歧义（这一点很重要——
+   原插件的 ini 用 GBK 编码，中文名称在不同系统下会乱码，给排查制造噪音）
+3. **可替换**：token 文件可被云端同步工具、CI 脚本、手机提取脚本随时更新，
+   Client 只关心"当前读到的 token 是什么"
+
+**为什么这样切分**：
+- token 是**低频变更**的（设备重置才会变），功耗是**高频**的（秒级）
+- 混在一起会导致「采集失败」和「token 失效」两种故障无法区分
+- 分开后，token 失效是一个**明确的、可观测的状态**（见 §5 降级策略）
+
+---
+
+## 2. 数据流设计
+
+### 2.1 采样来源
+
+**一次请求拿全部属性**（本机实测验证）：
+
+```json
+{"id":1,"method":"get_properties","params":[
+  {"did":"1234567890","siid":4,"piid":1},   // power-consumption  累计电量 (0.01 kWh)
+  {"did":"1234567890","siid":4,"piid":2},   // electric-power     实时功率 (W)
+  {"did":"1234567890","siid":4,"piid":3},   // voltage            电压 (V)
+  {"did":"1234567890","siid":4,"piid":4},   // electric-current   电流 (0.01 A)
+  {"did":"1234567890","siid":2,"piid":1}    // switch             开关状态
+]}
+```
+
+单次往返取 5 个属性，比原插件的「一次一个属性」**减少 80% 报文量**。
+
+实测性能（连续 30 次无间隔采样）：
+
+| 指标 | 实测值 |
+|---|---|
+| 成功率 | **30/30 (100%)** |
+| 平均耗时 | **69 ms/次** |
+| 不可达设备超时 | 5.0 s（超时值可配） |
+
+> 结论：即使 1 秒采样一次，设备侧也毫无压力；建议默认 2 秒。
+
+### 2.2 属性映射的自动发现
+
+**这是新方案与原插件最本质的差别。**
+
+```
+启动时（或型号变化时）：
+  1. 发 miIO.info  → 拿到 model（如 sixwgh.plug.v8icwf）、fw_ver、mac
+  2. 查 MiotSpec 内置表：
+       model "sixwgh.plug.v8icwf" → power=(4,2), energy=(4,1), volt=(4,3), curr=(4,4)
+  3. 表中无此型号 → 主动探测：
+       遍历 siid 1..20 × piid 1..8，用 get_properties 批量试探
+       观察哪些组合 code==0 且值随负载变化
+       → 结合 MIoT spec 服务名（power-consumption / electric-power）匹配
+  4. 探测结果写入 spec 缓存文件，下次启动直接用
+```
+
+探测时的批量试探是**一次请求问多个属性**（MIoT 允许 params 数组），30 个组合 3 次请求即可覆盖，
+不产生额外压力。
+
+**兜底**：若既无内置表、探测也失败（设备离线），则使用**通用启发式**——
+在 siid 1..20 × piid 1..8 范围内，寻找「数值型 + 随时间波动 + 量级符合功率」的候选，
+并按官方 MIoT spec 的服务描述优先匹配 `electric-power`。
+
+### 2.3 时间对齐
+
+```
+                    ┌─────── 采样时刻 (单调时钟) ───────┐
+   t0            t1            t2            t3
+   │             │             │             │
+   ▼             ▼             ▼             ▼
+ [Sample]     [Sample]     [Sample]     [Sample]
+   │             │             │             │
+   └─────────────┴─────────────┴─────────────┘
+                    │
+              写入队列（带 wall-clock 时间戳 + 单调时钟时间戳）
+```
+
+**双时间戳**是长稳运行的关键：
+
+| 字段 | 用途 |
+|---|---|
+| `wallClock` (UTC, ms) | 持久化用；跨重启对齐历史数据；用户可读 |
+| `monotonic` (ms) | 间隔计算用；**不受 NTP 校时/夏令时影响** |
+
+采样间隔用 **单调时钟差值**计算，不用 wall-clock 差值。
+这样即使系统时间被调整，积分计算（kWh）也不会出错。
+
+### 2.4 缓存与刷新策略
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  三级存储                                                │
+├─────────────────────────────────────────────────────────┤
+│  L1  最新快照 (LatestSnapshot)                          │
+│      单个结构体，原子替换，UI 无锁读取                    │
+│      → 任务栏显示直接读这里，零延迟                       │
+├─────────────────────────────────────────────────────────┤
+│  L2  实时环形缓冲 (RealtimeRing)                         │
+│      容量 = 2×(realtimeWindowSec / sampleIntervalSec)    │
+│      例如 10 分钟窗口 @2s 采样 → 300 点                   │
+│      → 悬停统计（10min/1h/24h）从这里算                   │
+├─────────────────────────────────────────────────────────┤
+│  L3  长期聚合 (LongTermStore)                            │
+│      分钟级聚合：均值/最大/最小/有效样本数                │
+│      保留 7 天，磁盘持久化                                │
+│      → 跨重启恢复，不丢历史                               │
+└─────────────────────────────────────────────────────────┘
+```
+
+**刷新节奏解耦**：
+
+| 环节 | 频率 | 说明 |
+|---|---|---|
+| 设备采集 | 2 s（可配 1~60） | 与设备能力匹配，实测 69ms/次无压力 |
+| 任务栏显示 | 1 s | 与 TrafficMonitor 主循环对齐，避免撕裂 |
+| 悬停统计 | 按需（鼠标悬停时算） | 缓存 30s 内结果 |
+| 磁盘落盘 | 60 s | 分钟聚合，防频繁 IO |
+| 握手维持 | 30 s | 见下 |
+
+**握手维持**：miIO 协议要求定期握手保持会话（python-miio 实测会连发 3 次握手包）。
+设计为**独立心跳**：每 30 s 发一次 hello 包（32 字节，开销极小），
+仅在收到非预期响应时才重握手。避免每次采样都重握手（那是原插件的做法，开销大且易触发设备限流）。
+
+### 2.5 缺口处理
+
+采集失败时**不写入空洞数据**，而是记录一个 Gap 标记：
+
+```cpp
+struct SampleGap {
+    uint64_t startMs;    // 缺口开始
+    uint64_t endMs;      // 缺口结束
+    int      failCount;  // 失败次数
+    ErrorKind kind;      // Timeout / ChecksumError / DeviceUnreachable / ...
+};
+```
+
+积分计算（kWh）遇到 gap 时**按缺口时长扣除**（用缺口前最后一次的功率值估算，或直接不计），
+并在 UI 上标注「数据不完整」，避免统计虚高。
+
+---
+
+## 3. token 计数与实时功耗的关联展示
+
+### 3.1 两个量的关系
+
+| 指标 | 来源 | 单位 | 语义 |
+|---|---|---|---|
+| **实时功率** | siid=4, piid=2 | W | 瞬时值 |
+| **累计电量（token 计数）** | siid=4, piid=1 | 0.01 kWh | 设备端累计，**不受采集断连影响** |
+
+关键性质（实测确认）：**累计电量由设备自身维护**，即使 PC 关机、插件停止，
+插座照样在计量。所以它是**权威基准**，可以用来：
+
+1. **校验本地积分** —— 本地积分（Σ 功率×Δt）与设备累计电量对比，偏差过大说明有数据缺口
+2. **补齐缺口** —— 断连期间的真实耗电可以从设备累计电量反推
+3. **成本/趋势展示** —— 累计电量天然适合做日/月趋势
+
+### 3.2 关联模型
+
+```
+   设备端累计电量 (权威)
+        │
+        │  ΔE_device  = E_now - E_prev
+        │  理论功率    = ΔE_device / Δt × 3600   (kWh → W)
+        │
+   ┌────┴────────────────────────────┐
+   │  一致性校验                       │
+   │  |P_local_avg - P_device_avg| < 阈值?  │
+   │     是 → 数据可信，标记 GREEN      │
+   │     否 → 存在缺口，标记 YELLOW     │
+   └────┬────────────────────────────┘
+        │
+   本地积分 (细粒度)  ──────┐
+        │                    │  两者结合
+        ▼                    ▼
+   ┌──────────────────────────────────┐
+   │  累计电量 = max(本地积分, 设备累计) │
+   │  差值 = 采集缺口期间漏掉的电        │
+   └──────────────────────────────────┘
+```
+
+**积分算法**（梯形积分，抗抖动）：
+
+```cpp
+// 梯形积分：比左端点矩形积分更平滑，且总量一致
+double dE_kwh = (P_prev + P_curr) / 2.0 * dt_hours / 1000.0;
+```
+
+### 3.3 UI 展示方案
+
+**任务栏（常驻，紧凑）**
+
+```
+功率: 63.4 W          ← 主指标，大字
+```
+
+**悬停提示（详情）**
+
+```
+┌─ 示例智能插座（WiFi计量） ──────────┐
+│  当前功率      63.4 W                  │
+│  电压 / 电流   237 V / 2.65 A          │
+│  开关状态      开启                    │
+├────────────────────────────────────────┤
+│  今日累计      0.85 kWh   电费 ≈ ¥0.52  │
+│  本月累计      12.30 kWh  电费 ≈ ¥7.38  │
+│  设备端计数    30.95 kWh  (权威)        │
+├────────────────────────────────────────┤
+│  近 10 分钟  最小 37.0  平均 45.2  最大 63.4 W │
+│  近 1 小时   最小 12.0  平均 38.7  最大 63.4 W │
+│  近 24 小时  最小 0.0   平均 21.4  最大 63.4 W │
+├────────────────────────────────────────┤
+│  数据完整性    98.7%   (缺口 12 分钟)    │
+│  采集状态      ● 正常                   │
+│  设备型号      sixwgh.plug.v8icwf       │
+│  固件          1.0.3_0004               │
+└────────────────────────────────────────┘
+```
+
+**关联可视化**（可选展开面板）：一条时间轴同时画
+- 柱状/折线 = 实时功率 (W)
+- 阶梯线 = 设备端累计电量 (kWh)
+- 阴影/红条 = 采集缺口
+
+两者叠加能直观看出「哪段时间用电多」和「哪段时间没采到数据」。
+
+**关键设计取舍**：任务栏只显示**功率**（用户最常看的），累计电量/电费放在悬停提示。
+理由：任务栏空间宝贵，塞两个数字会挤爆布局；而累计电量是"偶尔看一眼"的指标。
+
+---
+
+## 4. 关键接口与数据结构定义
+
+### 4.1 核心数据结构
+
+```cpp
+// ─── 采样点 ───────────────────────────────────────────────
+struct PowerSample {
+    uint64_t wallClockMs;   // UTC 毫秒
+    uint64_t monotonicMs;   // 单调时钟毫秒
+    double   watts;         // 实时功率 W
+    double   voltage;       // V
+    double   current;       // A
+    bool     switchOn;      // 开关
+    double   energyDevice;  // 设备端累计 (kWh)
+    bool     valid;         // 该点是否有效
+};
+
+// ─── 属性规格 ─────────────────────────────────────────────
+struct PropertyMap {
+    int  siidPower   = -1;  // 功率
+    int  piidPower   = -1;
+    int  siidEnergy  = -1;  // 累计电量
+    int  piidEnergy  = -1;
+    int  siidVoltage = -1;
+    int  piidVoltage = -1;
+    int  siidCurrent = -1;
+    int  piidCurrent = -1;
+    int  siidSwitch  = -1;
+    int  piidSwitch  = -1;
+    std::string model;      // 设备型号
+    bool     resolved = false;  // 是否已解析成功
+};
+
+// ─── 设备配置 ─────────────────────────────────────────────
+struct DeviceConfig {
+    std::string id;          // 逻辑 id，如 "plug-1"
+    std::string ip;
+    std::string name;        // 显示名
+    std::string modelHint;   // 可选，型号提示
+    bool        enabled = true;
+};
+
+// ─── 设备健康状态 ─────────────────────────────────────────
+enum class HealthState {
+    Unknown,        // 尚未尝试
+    Connecting,     // 首次握手中
+    Online,         // 正常
+    Degraded,       // 部分失败（能连上但属性读不到）
+    Offline,        // 连接失败
+    AuthFailed      // token 无效（checksum 错误）
+};
+
+struct DeviceHealth {
+    HealthState state = HealthState::Unknown;
+    int    consecutiveFailures = 0;
+    int    totalFailures = 0;
+    int    totalSuccess = 0;
+    uint64_t lastSuccessMs = 0;
+    uint64_t lastErrorMs = 0;
+    std::string lastError;
+    double successRate = 0.0;   // 滑动窗口成功率
+};
+
+// ─── 统计结果 ─────────────────────────────────────────────
+struct PowerStats {
+    double minW = 0, maxW = 0, avgW = 0, lastW = 0;
+    double integratedKwh = 0;   // 窗口内积分电量
+    size_t sampleCount = 0;
+    size_t gapCount = 0;
+    double coverage = 0.0;      // 数据覆盖率 (有效时长/总时长)
+};
+
+// ─── 采集结果 ─────────────────────────────────────────────
+struct Snapshot {
+    PowerSample sample;
+    HealthHealth health;   // 见 DeviceHealth
+    bool        fresh = false;  // 是否为本次新采样
+};
+```
+
+### 4.2 协议层接口
+
+```cpp
+class MiioClient {
+public:
+    MiioClient(std::string ip, std::string tokenHex, int timeoutMs = 3000);
+    ~MiioClient();
+
+    // 握手：获取 deviceId + serverStamp。幂等，30s 内自动复用。
+    bool Handshake();
+
+    // 原始命令。params 为已 JSON 序列化的数组。
+    bool Call(const std::string& method,
+              const std::string& paramsJson,
+              std::string& outResultJson,
+              ErrorKind* outErr = nullptr);
+
+    // MIoT 批量读属性（一次往返多属性）
+    bool GetProperties(const std::vector<PropertyRef>& props,
+                       std::vector<PropertyValue>& outValues,
+                       ErrorKind* outErr = nullptr);
+
+    // 解析 "result" 数组为属性值列表
+    static bool ParsePropertyResult(const std::string& resultJson,
+                                     std::vector<PropertyValue>& out);
+};
+
+// 错误分类（决定降级行为，务必细分）
+enum class ErrorKind {
+    None,
+    Timeout,              // 超时 → 可重试
+    NetworkUnreachable,   // 不可达 → 退避重试
+    ChecksumMismatch,     // token 错误 → 需人工介入，禁用自动重试风暴
+    DeviceBusy,           // 设备忙 → 短延迟重试
+    ProtocolError,        // 解析失败 → 记录并跳过
+    PropertyUnsupported    // 属性不支持 → 触发规格重解析
+};
+```
+
+### 4.3 服务层接口
+
+```cpp
+class IDeviceSource {   // 抽象：功耗数据来源（可为真实设备或回放/模拟）
+public:
+    virtual ~IDeviceSource() = default;
+    virtual bool Start() = 0;
+    virtual void Stop() = 0;
+    virtual bool Poll(Snapshot& out) = 0;   // 非阻塞，有数据返回 true
+    virtual DeviceHealth Health() const = 0;
+};
+
+class MiotSpecResolver {
+public:
+    // 解析型号 → 属性映射。优先查表；查不到则探测。
+    bool Resolve(MiioClient& client, PropertyMap& outMap);
+    void LoadCache();      // 从 spec 缓存文件加载
+    void SaveCache() const;
+private:
+    bool ProbeProperties(MiioClient& client, PropertyMap& outMap);
+};
+
+class PowerAggregator {
+public:
+    void AddSample(const PowerSample& s);
+    void AddGap(uint64_t startMs, uint64_t endMs, ErrorKind kind);
+    PowerStats GetStats(int windowSec) const;
+    double GetIntegratedKwh() const;      // 自上次启动的累计
+    double GetDeviceEnergyKwh() const;    // 设备端权威累计
+    double GetCoverage() const;           // 覆盖率
+private:
+    mutable std::mutex m_mutex;
+    std::deque<PowerSample> m_realtime;
+    std::deque<Gap>         m_gaps;
+    std::deque<MinuteBucket> m_minutes;   // 分钟聚合
+};
+
+class HistoryStore {   // 持久化
+public:
+    bool Load(const std::wstring& path);
+    bool Save(const std::wstring& path) const;   // 原子写：写临时文件 + rename
+    void AppendMinute(const MinuteBucket& b);
+private:
+    std::deque<MinuteBucket> m_buckets;   // 7 天
+};
+
+class TokenProvider {
+public:
+    // 按优先级尝试加载 token
+    bool Load(const TokenSearchPaths& paths, std::string& outTokenHex);
+    // 校验格式（32 hex）
+    static bool Validate(const std::string& tokenHex);
+    // 观察文件变更（用于外部工具热更新）
+    bool WatchForChange(const std::wstring& path, uint64_t lastWriteTime);
+};
+```
+
+### 4.4 配置存储格式
+
+**关键改进：token 独立成文件，与 ini 分离。**
+
+原插件把 IP/Token/Name 混在一个 GBK 编码的 ini 里 → 中文乱码 + token 无处安放 + 多设备无法表达。
+
+新方案：
+
+**`config.ini`**（UTF-8 with BOM，TrafficMonitor 宿主约定）
+```ini
+[General]
+SampleIntervalSec=2
+RealtimeWindowSec=600
+DisplayUnit=W
+DecimalPlaces=1
+EnableHistory=1
+HistoryRetentionDays=7
+PricePerKwh=0.65
+EnableDiagnostics=0
+
+[Display]
+ShowLabel=1
+ShowDeviceName=0
+ShowEnergyInTooltip=1
+
+[Device.plug-1]
+IP=192.168.1.10
+Name=示例智能插座
+ModelHint=sixwgh.plug.v8icwf
+Enabled=1
+TokenFile=mijia_tokens/plug-1.token
+```
+
+**`tokens/plug-1.token`**（纯 ASCII，一行）
+```
+00112233445566778899aabbccddeeff
+```
+
+好处：
+- token 文件可被任何脚本安全覆盖（原子替换），不担心破坏 ini 结构
+- UTF-8 BOM 让 Windows API 读中文名不乱码
+- 多设备通过 `[Device.xxx]` 段自然扩展
+
+---
+
+## 5. 异常处理与降级策略
+
+### 5.1 错误分类与响应矩阵
+
+| 错误 | 判别 | 立即动作 | 重试策略 | UI 表现 |
+|---|---|---|---|---|
+| **Timeout** | 5s 无响应 | 丢弃本次采样 | 指数退避重连：1s→2s→4s→8s→上限 30s | 显示最后已知值 + 灰色"超时"角标 |
+| **NetworkUnreachable** | socket 错误 | 同上 | 同上 | 显示 `--`（不显示陈旧值） |
+| **ChecksumMismatch** | 解密校验失败 | **停止自动重试** | **不自动重试**（防风暴），仅提示 | 红色"Token 无效" |
+| **PropertyUnsupported** | code=-4003/-4001 | 触发规格重解析 | 解析成功则继续 | 静默（日志记录） |
+| **DeviceBusy** | code=-9999 ack timeout | 丢弃本次 | 延迟 1s 重试 1 次 | 无提示 |
+| **协议解析失败** | JSON 解析异常 | 记录原始十六进制 | 下次采样继续 | 日志 + 诊断模式可见 |
+| **Token 文件缺失** | 文件不存在 | 保持最后有效 token | 不重试（等用户放文件） | 提示"请配置 token" |
+
+### 5.2 分级降级链
+
+```
+L0  正常        : 全部属性可读，UI 显示实时功率 + 完整统计
+      │  属性部分不可读
+      ▼
+L1  降级        : 功率可读但电压/电流缺失 → 只显示功率，隐藏次要指标
+      │  连续失败 > 3 次
+      ▼
+L2  陈旧        : 显示最后已知功率 + "最后更新于 X 秒前"，不伪装成实时
+      │  失败 > 60s
+      ▼
+L3  离线        : 显示 `--`，保留历史数据可查
+      │  恢复
+      ▼
+L0  自动恢复    : 握手重试成功 → 清空失败计数 → 补一个 gap 标记 → 回到 L0
+```
+
+**关键原则：宁可显示 `--`，也不显示过期的数字假装是实时的。**
+但保留"最后已知值 + 时间戳"作为参考，由用户自己判断。
+
+### 5.3 Token 中断场景
+
+这是原插件完全没有处理、但实际使用中很常见的情况：
+
+**场景**：插座被重置（换了 WiFi/重新配网）→ 设备端 token 失效 → 旧 token 校验失败。
+
+处理：
+
+```
+1. 检测到 ChecksumMismatch
+2. 立即停止重试（避免几十秒内发几百个无效包）
+3. UI 明确提示：「Token 已失效，请重新获取」
+4. 提供「一键打开 token 文件夹」按钮 + 「复制诊断信息」按钮
+5. 诊断信息包含：设备 model/mac/fw_ver（这些通过 miIO.info 仍可读）、
+   错误类型、最近 10 次采样日志
+6. 用户用 token 提取工具重新生成 token → 覆盖 token 文件
+7. 插件监控 token 文件 mtime 变化 → 自动热重载 → 无需重启 TM
+```
+
+**热重载**是这里的关键设计：文件监控用 `ReadDirectoryChangesW` 或简单轮询 mtime（30s 一次），
+检测到变化就重新构造 client。避免了"必须重启 TrafficMonitor"的糟糕体验。
+
+### 5.4 长时间运行
+
+| 风险 | 对策 |
+|---|---|
+| 内存泄漏（deque 无限增长） | 环形缓冲 + 容量硬上限；分钟桶按天淘汰 |
+| 句柄泄漏（socket） | RAII 封装，socket 生命周期 = client 生命周期 |
+| 磁盘写爆 | 只存分钟聚合，60s 一次，原子写 |
+| 设备限流 | 最小采样间隔 1s；握手心跳独立 30s |
+| 崩溃丢历史 | 每次落盘写临时文件 + `MoveFileEx` 原子替换 |
+| 线程竞争 | L1 快照用 `std::atomic`/双缓冲无锁读；聚合用单 mutex |
+| 系统休眠唤醒 | 单调时钟检测大间隔 → 记 gap，不做虚假插值 |
+| 时钟回拨 | 一律用单调时钟算间隔；wall-clock 仅用于展示 |
+| 插件卸载 | DLL 卸载时停止采集线程、join、释放资源（`DllMain` 不做重活） |
+
+### 5.5 崩溃安全
+
+```cpp
+// 保存用原子替换，避免掉电写坏文件
+bool HistoryStore::Save(const std::wstring& path) const {
+    std::wstring tmp = path + L".tmp";
+    // 写 tmp → FlushFileBuffers → MoveFileEx(tmp, path, MOVEFILE_REPLACE_EXISTING)
+    // 失败则保留旧文件，下次启动仍可读
+}
+```
+
+---
+
+## 6. 可配置项说明
+
+### 6.1 config.ini 完整项
+
+| 段 | 键 | 类型 | 默认 | 说明 |
+|---|---|---|---|---|
+| **General** | `SampleIntervalSec` | int | 2 | 采样间隔（秒），范围 1~60 |
+| | `RealtimeWindowSec` | int | 600 | 实时统计窗口（秒） |
+| | `HistoryRetentionDays` | int | 7 | 历史保留天数 |
+| | `PricePerKwh` | double | 0.65 | 电价（元/kWh），用于电费估算 |
+| | `EnableHistory` | bool | 1 | 是否落盘历史 |
+| | `EnableDiagnostics` | bool | 0 | 诊断模式（详细日志 + 原始报文） |
+| | `MaxRetryIntervalSec` | int | 30 | 重连退避上限 |
+| | `RequestTimeoutMs` | int | 3000 | 单次请求超时 |
+| **Display** | `ShowLabel` | bool | 1 | 任务栏显示"功率:"前缀 |
+| | `ShowUnit` | bool | 1 | 显示 W 单位 |
+| | `ShowDeviceName` | bool | 0 | 显示设备名（多设备时建议开） |
+| | `DecimalPlaces` | int | 1 | 小数位数 0~2 |
+| | `ShowEnergyInTooltip` | bool | 1 | 悬停显示累计电量 |
+| | `ShowStatsInTooltip` | bool | 1 | 悬停显示统计 |
+| | `StaleThresholdSec` | int | 30 | 超过此秒数标记为陈旧数据 |
+| **Device.<id>** | `IP` | string | — | 设备 IP（必填） |
+| | `Name` | string | — | 显示名 |
+| | `TokenFile` | string | — | token 文件路径（相对 config 目录） |
+| | `ModelHint` | string | — | 型号提示（跳过自动探测） |
+| | `Enabled` | bool | 1 | 是否启用 |
+| | `PropertyMap` | string | — | 手动覆盖属性映射，格式 `4.2,4.1,4.3,4.4,2.1` |
+
+### 6.2 token 文件
+
+纯文本，一行 32 位 hex，无 BOM：
+
+```
+00112233445566778899aabbccddeeff
+```
+
+### 6.3 运行时可写配置
+
+- **spec 缓存**（自动生成，勿手改）：`spec_cache.json` — 型号 → 属性映射
+- **诊断日志**：`diagnostics.log`（环形缓冲，启用诊断模式时写盘）
+
+---
+
+## 7. 新方案 vs 原插件改造：优势对比
+
+### 7.1 简洁性
+
+| 维度 | 原插件 | 新方案 | 优势 |
+|---|---|---|---|
+| **属性映射** | 硬编码在 C++ 字符串里 | 规格表 + 自动探测 + 缓存 | **换型号零改代码** |
+| **请求次数** | 1 次请求取 1 属性 | 1 次请求取 5 属性 | 报文量 ↓80% |
+| **代码组织** | 5 个 cpp/h 混 concerns | 3 层 9 模块，单一职责 | 可测性、可维护性 |
+| **配置** | GBK ini，token/name 混一起 | UTF-8 ini + 独立 token 文件 | 无乱码、支持多设备 |
+| **JSON 解析** | `find("\"value\":")` + `stod` | 结构化解析 + 错误码校验 | 不再把错误当成功 |
+| **错误分类** | 全部塞进 `bool` | 7 类 `ErrorKind` | 差异化降级 |
+| **token 更新** | 改 ini + 重启 TM | 覆盖文件 → 热重载 | 无需重启 |
+| **依赖** | 自研 MD5 + 自研 AES | 可选换 Windows CNG | 少 500 行密码学代码 |
+
+### 7.2 稳定性
+
+| 维度 | 原插件 | 新方案 |
+|---|---|---|
+| **握手** | 每次请求都重握手 | 30s 心跳 + 幂等复用 |
+| **重连** | 似乎无退避（需确认） | 指数退避 1→30s |
+| **静默失败** | 有（-4003 被当成功） | 无（错误码严格校验） |
+| **陈旧数据** | 不知道，可能显示旧值 | 显式标记 + 时间戳 |
+| **长期运行** | 无缺口记录，积分不可信 | gap 记录 + 覆盖率 + 设备端交叉校验 |
+| **崩溃恢复** | 无原子写 | 原子写 + 分钟级聚合恢复 |
+| **可诊断性** | 几乎为零 | 结构化日志 + 一键导出诊断 |
+| **多设备** | 不支持 | `[Device.x]` 段天然支持 |
+
+### 7.3 实现取舍与风险
+
+**取舍（主动接受的代价）**
+
+| 取舍 | 理由 | 代价 |
+|---|---|---|
+| 引入自动探测逻辑（~300 行） | 换来型号通用性 | 探测阶段多几次请求；需妥善处理探测失败 |
+| token 与 ini 分离 | 热重载、多设备、安全 | 用户需多一个文件；迁移要说明 |
+| 放弃"1 属性 1 请求"的简单 | 换 5 属性批量 | 响应解析稍复杂（需处理部分成功） |
+| 保留 UTF-8 + BOM | Windows 兼容中文 | 非常规工具处理 ini 需注意 BOM |
+| 不复用原插件的 Crypto | 原实现混淆严重，难审计 | 需引入/重写 ~200 行密码学代码 |
+| 动态 spec 探测有失败可能 | 覆盖更多型号 | 需保留手动 `PropertyMap` 覆盖逃生口 |
+
+**风险与缓解**
+
+| 风险 | 等级 | 缓解措施 |
+|---|---|---|
+| **固件升级改变 siid/piid** | 中 | 探测 + 缓存 + 手动覆盖三层兜底；探测到 -4003 时自动重解析 |
+| **AES/MD5 实现错误** | 高（一旦错全盘失效） | **用已知向量做单元测试**：本机 `miIO.info` 返回 token 回显一致即为黄金用例 |
+| **抓包验证困难**（本次踩坑） | 中 | 固化一个 `Selftest.exe`：跑通即证明协议层正确，不依赖人工点 UI |
+| **TrafficMonitor 宿主 API 变化** | 中 | 只依赖 `PluginInterface.h` 的公开接口；隔离在 `TrafficHostAdapter` |
+| **多线程与 TM 主循环冲突** | 中 | 采集线程只写自己的缓冲，UI 读无锁快照，绝不跨线程直接操作 TM 对象 |
+| **设备固件限制并发/频率** | 低 | 最小间隔 1s + 握手心跳独立 + 退避 |
+| **多设备 UDP 端口冲突** | 低 | 每个 client 独立 socket，源端口随机 |
+
+### 7.4 实施路线建议
+
+```
+阶段 1（可用）    协议层 + 采集 + 任务栏显示 + 配置
+                 → MiioClient + MiotSpecResolver(含探测) + 采集线程 + PowerItem
+                 → 用本机设备实测：model/功率/电量/电压/电流 全部正确
+
+阶段 2（稳健）    错误分类 + 退避重连 + 陈旧标记 + 缺口记录 + 诊断日志
+                 → 拔网/换token/休眠唤醒 等场景逐一验证
+
+阶段 3（完整）    历史持久化 + 悬停统计 + 电费估算 + 多设备 + 热重载
+
+阶段 4（打磨）    设置对话框 + 自检工具 + 规格缓存管理
+```
+
+**阶段 1 的验收标准（硬指标）**：
+- 连续 30 次采样成功率 ≥ 99%（实测基线 100%）
+- 平均单次耗时 < 100 ms（实测基线 69 ms）
+- 断网 30s 后恢复 ≤ 3 次重试内成功
+- 拔 token 后能明确提示"token 失效"而非显示 0W
+
+---
+
+## 附：本方案的全部结论均有本机实测支撑
+
+| 结论 | 验证方式 | 数据 |
+|---|---|---|
+| 握手拿不到真实 token | UDP 54321 hello 包 | 回包 token 字段全 `FF` |
+| token 在 MMKV 里 | root 读米家 App 私有目录 | `mmkv_id_local_control` → `key_local_control_cache_devices` |
+| siid=11 不适用 | get_properties 实测 | `-4003` |
+| siid=4/piid=2 是功率 | 官方 MIoT spec + 波动采样 | 37~63W 波动，236V/2.65A 自洽 |
+| did 字段不参与匹配 | 多种 did 实测 | 任意值均 code 0 |
+| 批量请求可行 | 一次请求取 5 属性 | 全部 code 0 |
+| 性能充足 | 30 次连续采样 | 30/30 成功，69ms/次 |
+| 断连可恢复 | 不可达设备测试 | 5s 超时，恢复后首次即成功 |
+| 原插件协议实现正确 | 反汇编逐字节核对 | 大端长度、device_id、ts、md5 均一致 |
+| 原插件缺错误码校验 | 读源码 | `find("\"value\":")` + `stod`，无 code 检查 |

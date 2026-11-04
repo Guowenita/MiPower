@@ -1,0 +1,40 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<root>
+	<skin>
+		<text_color>16768959,16768959,16768959,16768959,16768959,16768959,16768959,16768959,16768959</text_color>
+		<specify_each_item_color>0</specify_each_item_color>
+		<skin_author>MiPower</skin_author>
+		<font name="Microsoft YaHei" size="9" style="0"/>
+		<display_text>
+			<up>↑: </up>
+			<down>↓: </down>
+			<cpu>CPU: </cpu>
+			<memory>内存: </memory>
+		</display_text>
+	</skin>
+	<plugin_map>
+		<mipower>MiPowerW</mipower>
+		<mijiapower>MijiaPowerW</mijiapower>
+	</plugin_map>
+	<layout text_height="20" no_label="0">
+		<layout_l width="232" height="107">
+			<cpu x="14" y="3" width="106" align="0" show="1"/>
+			<memory x="88" y="3" width="106" align="0" show="1"/>
+			<up x="14" y="27" width="106" align="0" show="1"/>
+			<down x="122" y="27" width="106" align="0" show="1"/>
+			<mipower x="14" y="55" width="200" align="0" show="1"/>
+		</layout_l>
+		<layout_s width="232" height="50">
+			<cpu x="14" y="3" width="106" align="0" show="1"/>
+			<memory x="88" y="3" width="106" align="0" show="1"/>
+			<up x="14" y="27" width="106" align="0" show="1"/>
+			<down x="122" y="27" width="106" align="0" show="1"/>
+			<mipower x="14" y="50" width="100" align="0" show="1"/>
+			<mijiapower x="120" y="50" width="100" align="0" show="1"/>
+		</layout_s>
+	</layout>
+	<preview width="250" height="170">
+		<l x="0" y="0"/>
+		<s x="0" y="112"/>
+	</preview>
+</root>

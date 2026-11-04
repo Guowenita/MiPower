@@ -1,0 +1,86 @@
+=== MiPower 配置链路验证 (mode=all) ===
+
+=== A. ConfigStore Save -> Load 全字段往返 ===
+  [PASS] Save() succeeded
+  [PASS] Load() succeeded
+  [PASS] roundtrip: sampleIntervalSec
+  [PASS] roundtrip: pricePerKwh
+  [PASS] roundtrip: showTrend
+  [PASS] roundtrip: showCost
+  [PASS] roundtrip: trendMinutes
+  [PASS] roundtrip: showLabel
+  [PASS] roundtrip: showUnit
+  [PASS] roundtrip: showDeviceName
+  [PASS] roundtrip: decimalPlaces
+  [PASS] roundtrip: showEnergyInTooltip
+  [PASS] roundtrip: showStatsInTooltip
+  [PASS] roundtrip: enableHistory
+  [PASS] roundtrip: devices.size
+  [PASS] roundtrip: devices[0].ip
+  [PASS] roundtrip: devices[0].name
+  [PASS] roundtrip: devices[0].propertyMap
+  [PASS] ini has SampleIntervalSec=7
+  [PASS] ini has TrendMinutes=25
+  [PASS] ini has PropertyMap
+  [PASS] ini has edited IP
+
+=== B. 设置框输入 -> 确定/取消 一致性 ===
+  [PASS] init: propertyMap shows real config (empty), not hardcoded value
+  [PASS] OK: Show() returns changed=true
+  [PASS] OK in-memory: sampleIntervalSec
+  [PASS] OK in-memory: pricePerKwh
+  [PASS] OK in-memory: showTrend
+  [PASS] OK in-memory: showCost
+  [PASS] OK in-memory: trendMinutes
+  [PASS] OK in-memory: showLabel
+  [PASS] OK in-memory: showUnit
+  [PASS] OK in-memory: showDeviceName
+  [PASS] OK in-memory: decimalPlaces
+  [PASS] OK in-memory: showEnergyInTooltip
+  [PASS] OK in-memory: showStatsInTooltip
+  [PASS] OK in-memory: enableHistory
+  [PASS] OK in-memory: devices.size
+  [PASS] OK in-memory: devices[0].ip
+  [PASS] OK in-memory: devices[0].name
+  [PASS] OK in-memory: devices[0].propertyMap
+  [PASS] OK ini: SampleIntervalSec=7
+  [PASS] OK ini: DecimalPlaces=2
+  [PASS] OK ini: ShowCost=1
+  [PASS] OK ini: edited IP
+  [PASS] OK token file written on commit
+  [PASS] CANCEL: Show() returns changed=false
+  [PASS] CANCEL in-memory: sampleIntervalSec
+  [PASS] CANCEL in-memory: pricePerKwh
+  [PASS] CANCEL in-memory: showTrend
+  [PASS] CANCEL in-memory: showCost
+  [PASS] CANCEL in-memory: trendMinutes
+  [PASS] CANCEL in-memory: showLabel
+  [PASS] CANCEL in-memory: showUnit
+  [PASS] CANCEL in-memory: showDeviceName
+  [PASS] CANCEL in-memory: decimalPlaces
+  [PASS] CANCEL in-memory: showEnergyInTooltip
+  [PASS] CANCEL in-memory: showStatsInTooltip
+  [PASS] CANCEL in-memory: enableHistory
+  [PASS] CANCEL in-memory: devices.size
+  [PASS] CANCEL in-memory: devices[0].ip
+  [PASS] CANCEL in-memory: devices[0].name
+  [PASS] CANCEL in-memory: devices[0].propertyMap
+  [PASS] CANCEL: ini unchanged
+  [PASS] TEST+CANCEL: token file unchanged (no side effect)
+
+=== C. Collector::ApplyConfig 运行时生效（真实设备 192.168.1.10）===
+  warmup      : success=3 state=2 watts=39.0
+  [PASS] warmup: real device produced samples
+  interval=2s : +4 samples / 8s
+  interval=1s : +7 samples / 8s
+  [PASS] ApplyConfig(sampleIntervalSec) changes live sampling rate
+  bad IP      : success=16 failures=1 state=1
+  [PASS] ApplyConfig(IP) reconnects and old data stops
+  restore IP  : success=22 failures=1 state=2 watts=42.0
+  [PASS] ApplyConfig(IP back) recovers online sampling
+  bad propMap : success=22 failures=4 state=4
+  [PASS] ApplyConfig(propertyMap) re-resolves spec and takes effect
+  restore map : success=28 failures=4 state=2 watts=40.0
+  [PASS] ApplyConfig(propertyMap back) recovers sampling
+
+=== 汇总: ALL PASS (0 项失败) ===
