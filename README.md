@@ -1,8 +1,7 @@
 ﻿> **公开仓库说明**：本仓库为脱敏后的开源版本，源码、文档、配置模板与预编译
 > DLL 中**不含任何真实 token、内网 IP、设备标识或个人路径**。所有设备信息均为
-> 示例占位值，使用前请按 `PRIVACY.md` 替换为自己的设备信息。
-> `release/MiPower.dll` 为开源版产物（仅默认示例 IP 与测试基准不同，功能与已
-> 验证版本一致）；也可执行 `python build.py release` 从源码自行构建。
+> 醒目占位符（`<...>` 与 RFC 5737 文档地址），使用前请按 `PRIVACY.md` 替换。
+> `release/MiPower.dll` 为唯一预编译产物；也可执行 `python build.py release` 从源码构建。
 
 ---
 
@@ -13,6 +12,23 @@
 设计目标：**通用**（不硬编码型号）、**稳定**（错误分级降级）、**可维护**（分层清晰）。
 
 ---
+
+## 交付内容速查
+
+| 路径 | 内容 |
+|---|---|
+| `release/MiPower.dll` | **预编译插件 DLL（x64 / Release）**，唯一二进制产物，直接放入 TrafficMonitor 的 `plugins\` |
+| `src/` | 插件本体源码（19 个 `.h` / `.cpp`） |
+| `build.py` | 唯一构建入口：`python build.py release` |
+| `docs/插件设计方案.md` | 架构、协议、数据流与实现取舍 |
+| `README.md` / `PRIVACY.md` | 使用说明 / 脱敏与占位说明 |
+| `config/config.example.ini` | 配置模板（**醒目占位值，必须替换**） |
+| `config/tokens/plug-1.token.example` | token 占位模板 |
+| `skins/0MiPower/` | 插件显示项所需皮肤（含 `plugin_map`） |
+| `LICENSE` | MIT 许可 |
+
+> 仓库内所有 `192.0.2.x` 均为 RFC 5737 文档保留地址，`<...>` 均为醒目占位符，
+> **不能连接任何真实设备**。按 `PRIVACY.md` 替换后方可使用。
 
 ## 快速开始
 
@@ -40,8 +56,8 @@ plugins\
 
 ```ini
 [Device.plug-1]
-IP=192.168.1.10
-Name=示例智能插座
+IP=192.0.2.1
+Name=Example Plug
 TokenFile=plug-1.token
 Enabled=1
 ```
@@ -49,7 +65,7 @@ Enabled=1
 **填入 token** —— 把 32 位 hex 写进 `tokens/plug-1.token`：
 
 ```
-00112233445566778899aabbccddeeff
+<YOUR_DEVICE_TOKEN_32_HEX>
 ```
 
 > token 获取方法见文末「如何获取 token」。
@@ -171,35 +187,14 @@ TrafficMonitor → 选项 → 显示项设置 → 勾选「米家插座功率」
 
 ## 构建
 
-需要 Visual Studio 2022 Build Tools（含 C++ workload）。
+需要 Visual Studio 2022 Build Tools（C++ 工作负载）与 Windows SDK。
 
 ```bash
-python build.py release      # 或 debug
+python build.py release
 ```
 
-产物在 `build/`：
-
-| 文件 | 说明 |
-|---|---|
-| `MiPower.dll` | 插件本体 |
-| `selftest.exe` | 密码学与 JSON 解析单元测试 |
-| `devicetest.exe` | 真实设备联调测试 |
-| `hosttest.exe` | 模拟 TrafficMonitor 加载插件的端到端测试 |
-
-### 测试
-
-```bash
-cd build
-./selftest.exe                                    # 单元测试（应全部 PASS）
-./devicetest.exe 192.168.1.10 <token>             # 设备联调
-PLUGDIR=<plugins目录> ./hosttest.exe               # 端到端
-```
-
-`selftest.exe` 覆盖：
-- MD5 全部 RFC 1321 向量 + 100 万字节多块填充
-- AES-128 FIPS-197 附录 B / C.1 + NIST SP800-38A CBC 四组向量
-- miIO 密钥派生（key / iv 与 python-miio 对照）
-- JSON 属性解析
+产物为 `build/MiPower.dll`。仓库已提供预编译版 `release/MiPower.dll`，
+无需自行构建即可安装使用。
 
 ---
 

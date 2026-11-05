@@ -92,8 +92,8 @@ bool ConfigStore::WriteDefaultConfig(const std::wstring& path) {
         << "ShowStatsInTooltip=1\n"
         << "StaleThresholdSec=30\n"
         << "\n[Device.plug-1]\n"
-        << "IP=192.168.1.10\n"
-        << "Name=Smart Plug\n"
+        << "IP=192.0.2.1\n"
+        << "Name=Example Plug\n"
         << "TokenFile=plug-1.token\n"
         << "Enabled=1\n";
     return true;
@@ -110,7 +110,7 @@ bool ConfigStore::Load(AppConfig& cfg) {
         // 首次运行：写默认配置
         WriteDefaultConfig(iniPath);
         cfg = AppConfig();
-        cfg.devices.push_back({ "plug-1", "192.168.1.10", "Smart Plug", "", "", "", true });
+        cfg.devices.push_back({ "plug-1", "192.0.2.1", "Example Plug", "", "", "", true });
         return true;
     }
 
@@ -211,8 +211,8 @@ bool ConfigStore::Load(AppConfig& cfg) {
     if (cfg.devices.empty()) {
         DeviceConfig d;
         d.id = "plug-1";
-        d.ip = "192.168.1.10";
-        d.name = "Smart Plug";
+        d.ip = "192.0.2.1";
+        d.name = "Example Plug";
         cfg.devices.push_back(d);
     }
     return true;

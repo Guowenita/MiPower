@@ -1,41 +1,36 @@
-# 脱敏说明
+# 脱敏与占位说明
 
-本仓库是公开版本，已从源码、文档、配置、脚本与二进制产物中移除全部真实
-凭据与个人/设备标识。**仓库内的所有设备信息均为示例占位值，不能连接任何
-真实设备。**
+本仓库是公开版本，**不含任何真实设备凭据或个人/设备标识**。所有示例值均为
+醒目占位符；仓库内容不能连接任何真实设备，使用前必须替换。
 
-## 已脱敏项
+## 占位符对照
 
-| 类别 | 处理方式 | 示例占位值 |
+| 类别 | 仓库中的占位值 | 你需要替换为 |
 |---|---|---|
-| 米家设备 token（32 位 hex） | 全部替换为标准示例向量 | `00112233445566778899aabbccddeeff` |
-| 局域网设备 IP | 替换为文档示例地址 | `192.168.1.10` |
-| 测试用 IP（编辑值 / 不可达值） | 同步替换 | `192.168.1.77`、`192.168.1.199` |
-| 设备 DID / 十六进制 DID | 替换为占位编号 | `1234567890` / `0x499602d2` |
-| 设备 MAC | 替换为占位地址 | `00:11:22:33:44:55` |
-| Wi-Fi SSID | 替换为通用名 | `Example-SSID` |
-| 米家账号 UID | 替换为占位编号 | `1000000000` |
-| 设备自定义名称 | 中性化 | `示例智能插座` |
-| 本机绝对路径 / 用户名 / 工作区路径 | 移除或改为通用相对路径 | `%USERPROFILE%`、相对路径 |
-| 安装目录版本串 | 改为通用描述 | `TrafficMonitor 安装根目录` |
-| 绑定真实 token 的加密测试期望值 | 用示例 token 重新推导 | 见 `src/selftest.cpp` |
+| 设备 token | `<YOUR_DEVICE_TOKEN_32_HEX>` | 你自己设备的 32 位十六进制 token |
+| 设备 IP | `192.0.2.1`（RFC 5737 文档保留地址） | 设备局域网 IP |
+| 测试用 IP | `192.0.2.2` / `192.0.2.3` | 仅测试代码使用，无需替换 |
+| 设备 DID | `<DEVICE_DID>` / `<DEVICE_DID_HEX>` | 文档示例，无需替换 |
+| 设备 MAC | `<DEVICE_MAC>` | 文档示例，无需替换 |
+| Wi-Fi SSID | `<WIFI_SSID>` | 文档示例，无需替换 |
+| 米家账号 UID | `<ACCOUNT_UID>` | 文档示例，无需替换 |
+| 设备名 | `Example Plug` | 自定义显示名 |
 
 ## 仍然保留的内容（非隐私）
 
 - 设备型号 `sixwgh.plug.v8icwf` 等公开 MIoT 规格标识（内置规格表依赖）
 - 属性映射 `4.2,4.1,4.3,4.4,2.1` 等公开协议语义
-- MD5 / AES 标准测试向量（RFC 1321、FIPS-197、NIST SP800-38A）
-- 通用协议流程、错误码与 miIO 报文格式
+- miIO / MIoT 报文格式、错误码与 token 获取的通用方法
 
 ## 防御措施
 
-- `.gitignore` 排除 `*.token`、真实 `config.ini`、编译中间产物与日志
-- `config/config.example.ini` 与 `config/tokens/plug-1.token.example` 为可提交的模板
-- 测试程序默认 token / IP 均为占位值，联调真实设备需通过命令行参数传入
+- `.gitignore` 排除 `*.token`、真实 `config.ini`、构建中间产物、日志与备份
+- `config/config.example.ini` 与 `config/tokens/plug-1.token.example` 是可提交的模板
+- 源码默认 IP 指向不可路由的文档保留地址，未配置时不会误连任何设备
 
 ## 使用前的必要替换
 
 1. 把 `config/config.example.ini` 复制为 TrafficMonitor 的 `plugins/config.ini`
-2. 把其中的 IP 改为你的设备 IP
-3. 在 `plugins/tokens/` 写入你自己设备的 token
+2. 把 `IP` 改为你的设备 IP
+3. 在 `plugins/tokens/` 写入你自己设备的 `plug-1.token`
 4. 在 TrafficMonitor「选项 → 显示项设置」勾选「米家插座功率」

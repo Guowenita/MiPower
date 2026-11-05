@@ -198,8 +198,8 @@ void CMiPowerPlugin::EnsureStarted() {
             m_cfg = mp::AppConfig();
             DeviceConfig d;
             d.id = "plug-1";
-            d.ip = "192.168.1.10";
-            d.name = "Smart Plug";
+            d.ip = "192.0.2.1";
+            d.name = "Example Plug";
             m_cfg.devices.push_back(d);
         }
         m_staleThresholdSec = m_cfg.staleThresholdSec;
